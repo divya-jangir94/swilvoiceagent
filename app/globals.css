@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* App shell background & base typography */
+html,
+body {
+  @apply h-full text-slate-50 antialiased;
+  background-color: #080B18;
+}
+
+body {
+  @apply m-0;
+}
+
+#root,
+div[data-nextjs-router] {
+  @apply h-full;
+}
+
+/* Scrollbar styling for a slightly nicer look */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #334155 transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: #334155;
+  border-radius: 9999px;
+}
+
