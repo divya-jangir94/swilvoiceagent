@@ -5,8 +5,10 @@ import {
   fetchCartesiaAudio,
   FILLER_PHRASES,
   isSpeechRecognitionSupported,
-  startBargeInListener,
   startWebSpeechSTT,
+  startBargeInListener,
+  startContinuousWebSpeechSTT,
+  monitorSilence,
   type MicEnergyMonitor,
   type WebSpeechHandle,
 } from "@/lib/audio";
@@ -119,6 +121,81 @@ function isEcho(transcript: string, lastBotReply: string): boolean {
   return false;
 }
 
+/**
+ * Like isEcho(), but tolerates minor ASR word mistakes using edit distance
+ * (e.g. "swim" instead of "swil").
+ *
+ * This is primarily used to stop "self voice" barge-in where the bot's
+ * playback leaks into STT with 1-character errors.
+ */
+function isEchoFuzzy(transcript: string, lastBotReply: string): boolean {
+  if (!lastBotReply || !transcript) return false;
+
+  const normStr = (t: string) =>
+    t.toLowerCase()
+      .replace(/[^\w\s\u0900-\u097F]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const wordList = (t: string) =>
+    normStr(t).split(" ").filter((w) => w.length > 2);
+
+  const tWords = wordList(transcript);
+  const bWords = wordList(lastBotReply);
+  if (tWords.length === 0 || bWords.length === 0) return false;
+
+  let matches = 0;
+  for (const tw of tWords) {
+    const ok = bWords.some((bw) => bw === tw || editDistance(tw, bw) <= 1);
+    if (ok) matches += 1;
+  }
+
+  const matchRatio = matches / tWords.length;
+  return tWords.length >= 2 && matchRatio >= 0.8;
+}
+
+
+function normalizeSpeechText(t: string): string {
+  return t
+    .toLowerCase()
+    .replace(/[^\w\sऀ-ॿ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Self-voice reference guard for active TTS playback.
+ *
+ * Compares barge-in partial text against the exact normalized transcript
+ * currently being played by the agent. If they are very similar, it is
+ * likely speaker echo/self voice and should not trigger barge-in.
+ */
+function matchesSelfVoiceReference(partialText: string, activeTTSReference: string): boolean {
+  if (!partialText || !activeTTSReference) return false;
+
+  const pNorm = normalizeSpeechText(partialText);
+  const rNorm = normalizeSpeechText(activeTTSReference);
+  if (!pNorm || !rNorm) return false;
+
+  // Fast exact/prefix checks for common echo cases
+  if (pNorm.length >= 3 && rNorm.startsWith(pNorm)) return true;
+  if (pNorm.length >= 10 && rNorm.includes(pNorm)) return true;
+
+  const pWords = pNorm.split(" ").filter(Boolean);
+  const rWords = rNorm.split(" ").filter(Boolean);
+  if (!pWords.length || !rWords.length) return false;
+
+  let fuzzyMatches = 0;
+  for (const pw of pWords) {
+    if (pw.length < 2) continue;
+    const hit = rWords.some((rw) => rw === pw || (rw.length >= 2 && editDistance(pw, rw) <= 1));
+    if (hit) fuzzyMatches += 1;
+  }
+
+  const ratio = fuzzyMatches / Math.max(1, pWords.length);
+  return pWords.length >= 2 && ratio >= 0.7;
+}
+
 // Fisher-Yates shuffle — used to randomise the filler queue so the same
 // phrase never plays twice in a row until the whole set has been used.
 function shuffleArray<T>(arr: T[]): T[] {
@@ -149,13 +226,20 @@ export function VoiceRecorder() {
   const [isCallActive, setIsCallActive] = useState(false);
   const [callSeconds, setCallSeconds] = useState(0);
   const [isBargedIn, setIsBargedIn] = useState(false);  // true while barge-in recording
+  const [isUserSpeaking, setIsUserSpeaking] = useState(false); // true from first speech until end-of-speech VAD
 
   // ── refs ───────────────────────────────────────────────────────────────────
   const isCallActiveRef = useRef(false);
   const speechHandleRef = useRef<WebSpeechHandle | null>(null); // main STT handle
   const bargeInHandleRef = useRef<WebSpeechHandle | null>(null); // barge-in STT handle
   const bargeInFiredRef = useRef(false);                        // prevents double-trigger
+  const isUserSpeakingRef = useRef(false);
   const bargeInTimerRef = useRef<number | null>(null);          // startup delay timer
+  const bargeInConfirmingRef = useRef(false);                 // prevents double confirm
+  const vadCleanupRef = useRef<(() => void) | null>(null);
+  const vadFinalizationTimeoutRef = useRef<number | null>(null);
+  const capturedFinalRef = useRef<string>(""); // collects ONLY final transcript chunks
+  const latestInterimRef = useRef<string>(""); // fallback when no final chunk arrives
   const processTranscriptRef = useRef<((t: string) => void) | undefined>(undefined);
   const startCallListeningRef = useRef<(() => void) | undefined>(undefined);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -163,6 +247,9 @@ export function VoiceRecorder() {
   const audioInstanceRef = useRef<HTMLAudioElement | null>(null);
   // Tracks the last assistant reply text so isEcho() can compare it against STT results
   const lastBotReplyRef = useRef<string>("");
+  // Normalized text of the exact TTS currently playing. Used as self-voice
+  // reference so barge-in ignores agent playback picked up by the mic.
+  const activeTTSReferenceRef = useRef<string>("");
   // Timestamp (ms) when the last TTS audio finished — used for temporal echo guard
   const lastTTSEndRef = useRef<number>(0);
   // Consecutive "no speech" counter — used to show a mic-check hint after repeated failures
@@ -180,6 +267,9 @@ export function VoiceRecorder() {
   // speaker output.  Barge-in is only accepted when the mic is significantly
   // louder than this baseline (i.e. the user is actually speaking).
   const echoBaselineRef = useRef<number>(0);
+  // True only after we sampled echoBaselineRef for the current TTS turn.
+  // Prevents accepting barge-in based on stale/unknown baseline.
+  const echoBaselineReadyRef = useRef<boolean>(false);
   // setInterval handle used while sampling the echo baseline.
   const echoBaselineSamplerRef = useRef<number | null>(null);
 
@@ -190,6 +280,7 @@ export function VoiceRecorder() {
   const fillerIndexRef = useRef<Record<"en" | "hi", number>>({ en: 0, hi: 0 });
   const fillerLangRef = useRef<"en" | "hi">("en"); // mirrors the last TTS language used
   const fillerLoadedRef = useRef(false);
+  const fillerTimerRef = useRef<number | null>(null);
 
   // ── helpers ────────────────────────────────────────────────────────────────
   const updateSession = (updater: (prev: SessionState) => SessionState) => {
@@ -316,10 +407,11 @@ export function VoiceRecorder() {
     bargeInHandleRef.current = null;
     bargeInFiredRef.current = false;
     setIsBargedIn(false);
+    activeTTSReferenceRef.current = "";
   }, []);
 
   // ── play a Blob using a fresh Audio() instance (with barge-in support) ───
-  const playBlob = useCallback((blob: Blob) => {
+  const playBlob = useCallback((blob: Blob, ttsReferenceText = "") => {
     // Stop any previous audio and barge-in listener
     if (audioInstanceRef.current) {
       audioInstanceRef.current.pause();
@@ -335,6 +427,11 @@ export function VoiceRecorder() {
     audio.onplay = () => {
       vLog("ok", "PLAYBACK START", `${(blob.size / 1024).toFixed(1)}KB audio playing`);
       setIsSpeaking(true);
+      activeTTSReferenceRef.current = normalizeSpeechText(ttsReferenceText);
+
+      // Reset per-turn echo baseline so barge-in gating matches this specific TTS audio.
+      echoBaselineRef.current = 0;
+      echoBaselineReadyRef.current = false;
 
       // ── Echo baseline sampling ─────────────────────────────────────────────
       // Sample the mic RMS for the first second of TTS playback and store the
@@ -360,13 +457,14 @@ export function VoiceRecorder() {
             echoBaselineRef.current = avg;
             vLog("info", "ECHO BASELINE", `mic RMS = ${avg.toFixed(1)} over ${samples.length} samples`);
           }
-        }, 1000);
+          echoBaselineReadyRef.current = true;
+        }, 750);
       }
 
       if (isCallActiveRef.current) {
         const dur = isFinite(audio.duration) ? audio.duration : 3;
         // Open mic almost immediately for fast barge-in
-        const bargeInDelay = 200;
+        const bargeInDelay = 350;
 
         // ── startBarge: defined here so echo-restarts and timeout-restarts
         // can both reuse the same setup without duplicating callbacks.
@@ -401,25 +499,74 @@ export function VoiceRecorder() {
                 return;
               }
 
-              // ── Guard 2: adaptive energy gate ────────────────────────────────
-              // On very quiet mic setups (baseline ≤ 0.8), the RMS readings for
-              // bot echo vs user voice are indistinguishable (both ~0.6).
-              // We skip the gate entirely for these "quiet mic" users.
-              // For speaker/loud users (baseline > 0.8), the gate helps prevent
-              // loud echo from falsely triggering a barge-in.
-              let energyPassedGate = true;
-              if (micEnergyMonitorRef.current && echoBaselineRef.current > 0.8) {
-                const micRMS = micEnergyMonitorRef.current.getRMS();
-                const threshold = echoBaselineRef.current * 1.5;
-                if (micRMS < threshold) {
-                  energyPassedGate = false;
-                  vLog("warn", "BARGE-IN ECHO", `energy gate: mic=${micRMS.toFixed(1)} baseline=${echoBaselineRef.current.toFixed(1)} — flushing`);
+              // If we have a mic energy monitor, wait for the echo baseline to be sampled
+              // before accepting a barge-in. This prevents interrupting on the first
+              // few echoed words while the baseline is still "unknown".
+              if (micEnergyMonitorRef.current && !echoBaselineReadyRef.current && audioElapsed < 350) {
+                vLog("warn", "BARGE-IN", `baseline not ready (${audioElapsed}ms) — flushing`);
+                bargeInHandleRef.current?.stop();
+                bargeInHandleRef.current = null;
+                setTimeout(startBarge, 300);
+                return;
+              }
+
+              // ── Guard 1.5: self-voice reference (active TTS text) ───────────
+              // If partial STT looks like what the bot is currently saying, treat
+              // it as echo and keep playing.
+              if (matchesSelfVoiceReference(partialText, activeTTSReferenceRef.current)) {
+                const baseline = echoBaselineRef.current;
+                const micNow = micEnergyMonitorRef.current?.getRMS() ?? 0;
+                const nearEchoFloor = micNow < Math.max(baseline * 1.35, baseline + 0.35, 0.9);
+
+                if (nearEchoFloor) {
+                  vLog(
+                    "warn",
+                    "BARGE-IN ECHO",
+                    `self-reference guard: \"${partialText.slice(0, 50)}\" mic=${micNow.toFixed(1)} baseline=${baseline.toFixed(1)}`
+                  );
                   bargeInHandleRef.current?.stop();
                   bargeInHandleRef.current = null;
                   setTimeout(startBarge, 300);
                   return;
                 }
-                vLog("info", "BARGE-IN", `energy confirmed voice: mic=${micRMS.toFixed(1)} vs baseline=${echoBaselineRef.current.toFixed(1)}`);
+
+                vLog(
+                  "info",
+                  "BARGE-IN",
+                  `self-reference seen but energy high; continue mic=${micNow.toFixed(1)} baseline=${baseline.toFixed(1)}`
+                );
+              }
+
+              // ── Guard 2: adaptive energy gate ────────────────────────────────
+              // Require mic energy to be above the sampled echo baseline.
+              // This prevents "self voice" barge-ins when the user isn't
+              // actually speaking but the bot's playback is leaking into STT.
+              let energyPassedGate = true;
+              if (micEnergyMonitorRef.current && echoBaselineReadyRef.current) {
+                const micRMS = micEnergyMonitorRef.current.getRMS();
+                const baseline = echoBaselineRef.current;
+                const isQuietMic = baseline <= 0.8;
+
+                // For quiet mic setups, mic RMS may be similar for bot echo vs real user speech.
+                // In that case, skip the energy gate and rely on the text/final-echo rejection.
+                if (!isQuietMic) {
+                  const threshold = Math.max(baseline * 1.5, baseline + 0.25);
+                  if (micRMS < threshold) {
+                    energyPassedGate = false;
+                    vLog(
+                      "warn",
+                      "BARGE-IN ECHO",
+                      `energy gate: mic=${micRMS.toFixed(1)} baseline=${baseline.toFixed(1)} thr=${threshold.toFixed(1)} — flushing`
+                    );
+                    bargeInHandleRef.current?.stop();
+                    bargeInHandleRef.current = null;
+                    setTimeout(startBarge, 300);
+                    return;
+                  }
+                  vLog("info", "BARGE-IN", `energy confirmed voice: mic=${micRMS.toFixed(1)} vs baseline=${baseline.toFixed(1)}`);
+                } else {
+                  vLog("info", "BARGE-IN", `quiet mic: skipping energy gate baseline=${baseline.toFixed(1)} mic=${micRMS.toFixed(1)}`);
+                }
               }
 
               // ── Guard 3: text + fuzzy overlap ────────────────────────────────
@@ -433,6 +580,7 @@ export function VoiceRecorder() {
                 const isPrefixEcho = tNorm.length >= 3 && bNorm.startsWith(tNorm);
                 const isLongEcho = tNorm.length >= 10 && bNorm.includes(tNorm);
                 const isWordOverlapEcho = isEcho(partialText, lastBotReplyRef.current);
+                const isFuzzyWordOverlapEcho = isEchoFuzzy(partialText, lastBotReplyRef.current);
 
                 // Fuzzy first-word: only fires when energy also passed (meaning some
                 // audio was detected) — prevents false positives on unrelated words.
@@ -442,49 +590,149 @@ export function VoiceRecorder() {
                   && tFirst.length >= 3 && bFirst.length >= 3
                   && editDistance(tFirst, bFirst) <= 1;
 
-                if (isPrefixEcho || isLongEcho || isWordOverlapEcho || isFuzzyFirstWord) {
-                  const reason = isPrefixEcho ? "prefix" : isLongEcho ? "substring" : isFuzzyFirstWord ? `fuzzy(${tFirst}≈${bFirst})` : "overlap";
-                  vLog("warn", "BARGE-IN ECHO", `text guard: flushed (${reason}): "${partialText.slice(0, 50)}"`);
+                const baseline = echoBaselineRef.current;
+                const micNow = micEnergyMonitorRef.current?.getRMS() ?? 0;
+                const nearEchoFloor = micNow < Math.max(baseline * 1.35, baseline + 0.35, 0.9);
+
+                // Overlap-based text guards are very effective for echo, but if mic
+                // energy is clearly above echo floor, the user may be talking over TTS.
+                const shouldFlushByTextGuard =
+                  (isPrefixEcho || isLongEcho || isWordOverlapEcho || isFuzzyWordOverlapEcho || isFuzzyFirstWord)
+                  && nearEchoFloor;
+
+                if (shouldFlushByTextGuard) {
+                  const reason = isPrefixEcho
+                    ? "prefix"
+                    : isLongEcho
+                      ? "substring"
+                      : isFuzzyWordOverlapEcho
+                        ? "fuzzy-word-overlap"
+                        : isFuzzyFirstWord
+                          ? `fuzzy(${tFirst}≈${bFirst})`
+                          : "overlap";
+                  vLog(
+                    "warn",
+                    "BARGE-IN ECHO",
+                    `text guard: flushed (${reason}): "${partialText.slice(0, 50)}" mic=${micNow.toFixed(1)} baseline=${baseline.toFixed(1)}`
+                  );
                   bargeInHandleRef.current?.stop();
                   bargeInHandleRef.current = null;
                   setTimeout(startBarge, 300);
                   return;
                 }
+
+                if (isPrefixEcho || isLongEcho || isWordOverlapEcho || isFuzzyWordOverlapEcho || isFuzzyFirstWord) {
+                  vLog(
+                    "info",
+                    "BARGE-IN",
+                    `text overlap seen but energy high; continue mic=${micNow.toFixed(1)} baseline=${baseline.toFixed(1)}`
+                  );
+                }
               }
 
-              bargeInFiredRef.current = true;
-              vLog("info", "BARGE-IN", `user interrupted — "${partialText.slice(0, 40)}"`);
-              
-              // 1. Pause bot audio immediately
-              audio.pause();
-              URL.revokeObjectURL(url);
-              audioInstanceRef.current = null;
-              setIsSpeaking(false);
-              setInterimText(""); // clear interim text to show fresh capture
+              // Energy confirmation: self-voice often produces a short ASR trigger,
+              // but real speech stays loud for a short sustained window.
+              // We only pause TTS after sustained mic energy exceeds a stricter gate.
+              if (bargeInConfirmingRef.current) return;
+              bargeInConfirmingRef.current = true;
 
-              // 2. Stop the current barge-in listener session
-              bargeInHandleRef.current?.stop();
-              bargeInHandleRef.current = null;
+              const baselineForConfirm = echoBaselineReadyRef.current ? echoBaselineRef.current : 0.3;
+              // During TTS, AEC often keeps mic RMS low (0.5–4) even for real speech.
+              // A fixed floor like 6.5 made barge-in impossible. Use baseline-relative
+              // thresholds: quiet echo floor → need clear lift above it; loud floor → stricter ratio.
+              const quietEcho = baselineForConfirm <= 1.15;
+              const thresholdConfirm = quietEcho
+                // Quiet-mic devices often report real user speech around 1.1–1.6 RMS.
+                // Keep threshold low enough to allow barge-in while self-reference
+                // guard still blocks bot playback.
+                ? Math.max(baselineForConfirm * 1.30, baselineForConfirm + 0.25, 0.9)
+                : Math.max(baselineForConfirm * 1.30, baselineForConfirm + 0.30);
+              const partialWordCount = partialText.trim().split(/\s+/).filter(Boolean).length;
 
-              // 3. Start a FRESH main listening session to capture the full message.
-              // This gives the user a full Web Speech session duration to finish speak.
-              setTimeout(() => {
-                if (isCallActiveRef.current) {
-                  startCallListeningRef.current?.();
+              let hits = 0;
+              let total = 0;
+              let peak = 0;
+              const confirmStart = Date.now();
+              const tickMs = 50;
+              const confirmWindowMs = 450;
+              const interval = window.setInterval(() => {
+                if (!micEnergyMonitorRef.current) return;
+                const rms = micEnergyMonitorRef.current.getRMS();
+                total += 1;
+                if (rms > peak) peak = rms;
+                if (rms >= thresholdConfirm) hits += 1;
+              }, tickMs);
+
+              window.setTimeout(() => {
+                window.clearInterval(interval);
+                bargeInConfirmingRef.current = false;
+
+                // Ensure we are still looking at the same TTS audio turn.
+                if (!isCallActiveRef.current) return;
+                if (audioInstanceRef.current !== audio) return;
+
+                const elapsed = Date.now() - confirmStart;
+                const hitRatio = total > 0 ? hits / total : 0;
+                // ~9 samples @ 50ms; allow slower/soft speech by accepting
+                // either sustained medium lift or a short strong peak.
+                const peakConfirms = peak >= thresholdConfirm + (quietEcho ? 0.10 : 0.15);
+                const sustained =
+                  total >= 5 && hits >= 2 && hitRatio >= 0.22;
+                const slowSpeechFallback =
+                  partialWordCount >= 2 &&
+                  total >= 6 &&
+                  peak >= Math.max(baselineForConfirm + 0.25, 1.0);
+                const confirmed =
+                  sustained ||
+                  (total >= 4 && peakConfirms && hits >= 1) ||
+                  slowSpeechFallback;
+
+                if (!confirmed) {
+                  vLog(
+                    "warn",
+                    "BARGE-IN ECHO",
+                    `energy confirmation failed: rmsHits=${hits}/${total} (${(elapsed)}ms) thr=${thresholdConfirm.toFixed(1)} — ignoring`
+                  );
+                  bargeInHandleRef.current?.stop();
+                  bargeInHandleRef.current = null;
+                  setTimeout(startBarge, 250);
+                  return;
                 }
-              }, 150);
+
+                bargeInFiredRef.current = true;
+                vLog("info", "BARGE-IN", `user interrupted — "${partialText.slice(0, 40)}"`);
+
+                // 1. Pause bot audio immediately
+                audio.pause();
+                URL.revokeObjectURL(url);
+                audioInstanceRef.current = null;
+                activeTTSReferenceRef.current = "";
+                // Stamp "TTS ended" timestamp even though we paused early.
+                // This improves the echo guard window for the next VAD listening cycle.
+                lastTTSEndRef.current = Date.now();
+                setIsSpeaking(false);
+                setIsBargedIn(true);
+                setInterimText(partialText.trim()); // show what we captured so far
+
+                // Stop barge-in recognition and switch to the VAD-driven listening
+                // flow. We finalize only via VAD silence.
+                bargeInHandleRef.current?.stop();
+                bargeInHandleRef.current = null;
+                setTimeout(() => {
+                  if (isCallActiveRef.current) startCallListeningRef.current?.();
+                }, 150);
+              }, confirmWindowMs);
             },
 
             // ② Live preview while user speaks
             onInterim: (text) => setInterimText(text),
 
             // ③ Recognition session ended
-            onEnd: () => {
+            onEnd: (finalTranscript) => {
               bargeInHandleRef.current = null;
-              // If bargeInFired was true, we've already started the fresh session
-              // so there's nothing to do here. Reset the flag.
               if (bargeInFiredRef.current) {
                 bargeInFiredRef.current = false;
+                setIsBargedIn(false);
                 return;
               }
 
@@ -518,12 +766,15 @@ export function VoiceRecorder() {
       setIsSpeaking(false);
       URL.revokeObjectURL(url);
       audioInstanceRef.current = null;
+      activeTTSReferenceRef.current = "";
       stopBargeIn();
       // Cancel baseline sampler in case audio ended before the 1s window closed
       if (echoBaselineSamplerRef.current !== null) {
         window.clearInterval(echoBaselineSamplerRef.current);
         echoBaselineSamplerRef.current = null;
       }
+      echoBaselineRef.current = 0;
+      echoBaselineReadyRef.current = false;
       lastTTSEndRef.current = Date.now(); // stamp for temporal echo guard
       if (isCallActiveRef.current) {
         // Echo cooldown: base 300 ms + 80 ms/s, capped at 1500 ms.
@@ -545,11 +796,14 @@ export function VoiceRecorder() {
       setIsSpeaking(false);
       URL.revokeObjectURL(url);
       audioInstanceRef.current = null;
+      activeTTSReferenceRef.current = "";
       stopBargeIn();
       if (echoBaselineSamplerRef.current !== null) {
         window.clearInterval(echoBaselineSamplerRef.current);
         echoBaselineSamplerRef.current = null;
       }
+      echoBaselineRef.current = 0;
+      echoBaselineReadyRef.current = false;
       if (isCallActiveRef.current) {
         setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 800);
       }
@@ -558,6 +812,7 @@ export function VoiceRecorder() {
     audio.play().catch((err) => {
       vLog("warn", "PLAY BLOCKED", `autoplay policy blocked — ${err}`);
       setIsSpeaking(false);
+      activeTTSReferenceRef.current = "";
       stopBargeIn();
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -613,14 +868,27 @@ export function VoiceRecorder() {
       prefetchFillers(); // non-blocking — runs in background while AI processes
     }
 
-    // ── Play filler immediately so silence is filled while AI processes ───────
-    // getNextFiller() returns null on turn 1 (still loading) — that's fine,
-    // the user won't notice on the very first reply.
-    // From turn 2 onwards the cache is populated and fillers play instantly.
-    const fillerBlob = getNextFiller();
-    if (fillerBlob) {
-      vLog("info", "FILLER", `playing ${fillerLangRef.current} filler`);
-      playFillerBlob(fillerBlob);
+    // ── Situational filler: only if AI is still processing after delay ────────
+    // This avoids unnecessary fillers on very fast responses.
+    const transcriptWordCount = transcript.trim().split(/\s+/).filter(Boolean).length;
+    const shouldConsiderFiller = newUserTurns > 1 || transcriptWordCount >= 3;
+    if (fillerTimerRef.current !== null) {
+      window.clearTimeout(fillerTimerRef.current);
+      fillerTimerRef.current = null;
+    }
+    if (shouldConsiderFiller) {
+      fillerTimerRef.current = window.setTimeout(() => {
+        fillerTimerRef.current = null;
+        if (!isCallActiveRef.current) return;
+        if (status !== "processing") return;
+        if (isSpeaking || isUserSpeakingRef.current) return;
+
+        const fillerBlob = getNextFiller();
+        if (fillerBlob) {
+          vLog("info", "FILLER", `playing ${fillerLangRef.current} filler`);
+          playFillerBlob(fillerBlob);
+        }
+      }, 900);
     }
 
     try {
@@ -673,6 +941,10 @@ export function VoiceRecorder() {
       }));
 
       setStatus("idle");
+      if (fillerTimerRef.current !== null) {
+        window.clearTimeout(fillerTimerRef.current);
+        fillerTimerRef.current = null;
+      }
 
       if (newUserTurns >= MAX_TURNS && isCallActiveRef.current) {
         setCallActive(false);
@@ -680,7 +952,7 @@ export function VoiceRecorder() {
       }
 
       if (ttsBlob) {
-        playBlob(ttsBlob);
+        playBlob(ttsBlob, assistantText);
       } else if (isCallActiveRef.current) {
         setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 800);
       }
@@ -690,6 +962,10 @@ export function VoiceRecorder() {
       vLog("error", "PIPELINE ERROR", msg);
       setError(msg);
       setStatus("error");
+      if (fillerTimerRef.current !== null) {
+        window.clearTimeout(fillerTimerRef.current);
+        fillerTimerRef.current = null;
+      }
       updateSession((prev) => ({
         ...prev,
         messages: prev.messages.filter((m) => m.id !== userMessage.id),
@@ -702,9 +978,9 @@ export function VoiceRecorder() {
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session, playBlob, getNextFiller, playFillerBlob]);
+  }, [session, status, isSpeaking, playBlob, getNextFiller, playFillerBlob]);
 
-  // ── call mode: Web Speech API → AI → TTS loop ─────────────────────────────
+  // ── call mode: VAD + continuous Web Speech STT → AI → TTS loop ───────────
   const startCallListening = useCallback(() => {
     if (!isCallActiveRef.current) return;
 
@@ -716,81 +992,62 @@ export function VoiceRecorder() {
       return;
     }
 
-    // Stop any stale session before creating a new one — prevents two concurrent
-    // recognition instances when the function is called in quick succession
-    // (e.g. echo guard retries, barge-in fallback, error retries).
+    // Stop any stale session before creating a new one.
     if (speechHandleRef.current) {
       speechHandleRef.current.stop();
       speechHandleRef.current = null;
+    }
+    if (vadCleanupRef.current) {
+      vadCleanupRef.current();
+      vadCleanupRef.current = null;
+    }
+    if (vadFinalizationTimeoutRef.current !== null) {
+      window.clearTimeout(vadFinalizationTimeoutRef.current);
+      vadFinalizationTimeoutRef.current = null;
     }
 
     setError(null);
     setStatus("recording");
     setInterimText("");
+    isUserSpeakingRef.current = false;
+    setIsUserSpeaking(false);
+    capturedFinalRef.current = "";
+    latestInterimRef.current = "";
+
+    // We need the echo-cancelled mic stream for VAD.
+    if (!micStreamRef.current) {
+      setTimeout(() => {
+        if (isCallActiveRef.current) startCallListeningRef.current?.();
+      }, 250);
+      return;
+    }
+
+    const msSinceTTS = Date.now() - lastTTSEndRef.current;
+    // During immediate post-TTS time windows, raise threshold to reduce bot-echo triggering.
+    const threshold = msSinceTTS < 700 ? 14 : 8;
+    const userTurnsSoFar =
+      (session ?? loadSession()).messages.filter((m) => m.role === "user").length;
+    // Fast-start for the very first utterance after pressing Start Call:
+    // users often say a short greeting ("hello"), so we endpoint sooner.
+    const isFirstTurnInSession = userTurnsSoFar === 0;
+    const silenceDurationMs = isFirstTurnInSession ? 900 : 1800;
+    const postSilenceBufferMs = isFirstTurnInSession ? 250 : 800;
+    const minSpeechDurationMs = isFirstTurnInSession ? 350 : 650;
+    const noSpeechTimeoutMs = isFirstTurnInSession ? 4000 : 7000;
 
     try {
-      const handle = startWebSpeechSTT({
-        lang: "en-IN",  // English (India) — captures English perfectly, Hindi via romanization
-
+      // 1) Continuous STT: collect ONLY final segments
+      speechHandleRef.current = startContinuousWebSpeechSTT({
+        lang: "en-IN",
+        onFinal: (finalText) => {
+          const t = finalText.trim();
+          if (!t) return;
+          capturedFinalRef.current = capturedFinalRef.current ? `${capturedFinalRef.current} ${t}` : t;
+        },
         onInterim: (text) => {
+          latestInterimRef.current = text.trim();
           setInterimText(text);
         },
-
-        onEnd: (finalTranscript) => {
-          speechHandleRef.current = null;
-          setInterimText("");
-
-          if (!isCallActiveRef.current) return;
-
-          const clean = finalTranscript.trim();
-
-          if (!clean) {
-            noSpeechCountRef.current += 1;
-            vLog("warn", "NO SPEECH", `Web Speech returned empty — retry #${noSpeechCountRef.current}`);
-            if (noSpeechCountRef.current >= 2) {
-              // Show a mic-check hint after 2 consecutive silent rounds
-              setError("Can't hear you. Please speak clearly or check your microphone.");
-              setStatus("error");
-              // Auto-clear the error and retry after 3 s so the call stays alive
-              setTimeout(() => {
-                if (isCallActiveRef.current) {
-                  setError(null);
-                  noSpeechCountRef.current = 0;
-                  startCallListeningRef.current?.();
-                }
-              }, 3000);
-            } else {
-              setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 500);
-            }
-            return;
-          }
-          // Reset counter on successful speech
-          noSpeechCountRef.current = 0;
-
-          // ── Echo guard (3 layers) ─────────────────────────────────────────
-          const wordCount = clean.split(/\s+/).filter(Boolean).length;
-          const msSinceTTS = Date.now() - lastTTSEndRef.current;
-
-          // Layer 1 — Temporal + length: a single-word burst arriving within
-          // 1200 ms of TTS end is almost always speaker echo, not real speech.
-          // Uses 1 word (not 3) so real short replies like "हाँ जी" or "okay"
-          // are never suppressed — only bare single-word echo blips are caught.
-          if (wordCount === 1 && msSinceTTS < 1200) {
-            vLog("warn", "ECHO (temporal)", `"${clean}" — 1 word, ${msSinceTTS}ms after TTS`);
-            setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 300);
-            return;
-          }
-
-          // Layer 2 — Word overlap: transcript matches bot reply text
-          if (isEcho(clean, lastBotReplyRef.current)) {
-            vLog("warn", "ECHO (overlap)", `"${clean.slice(0, 60)}" — restarting listener`);
-            setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 300);
-            return;
-          }
-
-          processTranscript(clean);
-        },
-
         onError: (err) => {
           speechHandleRef.current = null;
           setInterimText("");
@@ -803,15 +1060,93 @@ export function VoiceRecorder() {
         },
       });
 
-      speechHandleRef.current = handle;
+      // 2) VAD: finalize only when silence persists long enough.
+      vadCleanupRef.current = monitorSilence(
+        micStreamRef.current,
+        (spokenMs) => {
+          // This callback already implies silenceDurationMs + postSilenceBufferMs,
+          // and monitorSilence also ignores short utterances.
+          vadCleanupRef.current = null;
+          speechHandleRef.current?.stop();
+          speechHandleRef.current = null;
 
+          isUserSpeakingRef.current = false;
+          setIsUserSpeaking(false);
+          setInterimText("");
+
+          if (!isCallActiveRef.current) return;
+
+          // Prefer true final chunks. If browser didn't emit isFinal in time,
+          // fall back to the latest interim text so real speech isn't dropped.
+          let clean = capturedFinalRef.current.trim();
+          if (!clean) {
+            const interimFallback = latestInterimRef.current.trim();
+            if (interimFallback.length >= 2) {
+              clean = interimFallback;
+              vLog("info", "STT FALLBACK", `using interim fallback: "${clean.slice(0, 60)}"`);
+            }
+          }
+          capturedFinalRef.current = "";
+          latestInterimRef.current = "";
+
+          if (!clean) {
+            noSpeechCountRef.current += 1;
+            vLog("warn", "NO SPEECH", `VAD ended but transcript empty — retry #${noSpeechCountRef.current}`);
+            if (noSpeechCountRef.current >= 2) {
+              setError("Can't hear you. Please speak clearly or check your microphone.");
+              setStatus("error");
+              setTimeout(() => {
+                if (isCallActiveRef.current) {
+                  setError(null);
+                  noSpeechCountRef.current = 0;
+                  startCallListeningRef.current?.();
+                }
+              }, 3000);
+            } else {
+              setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 500);
+            }
+            return;
+          }
+
+          noSpeechCountRef.current = 0;
+
+          // ── Echo guard (avoid self-voice / bot playback) ────────────────
+          const wordCount = clean.split(/\s+/).filter(Boolean).length;
+          const msSinceTTS2 = Date.now() - lastTTSEndRef.current;
+          if (wordCount === 1 && msSinceTTS2 < 1200) {
+            vLog("warn", "ECHO (temporal)", `"${clean}" — 1 word, ${msSinceTTS2}ms after TTS`);
+            setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 300);
+            return;
+          }
+          if (isEcho(clean, lastBotReplyRef.current) || isEchoFuzzy(clean, lastBotReplyRef.current)) {
+            vLog("warn", "ECHO (overlap)", `"${clean.slice(0, 60)}" — restarting listener`);
+            setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 300);
+            return;
+          }
+
+          processTranscript(clean);
+        },
+        {
+          threshold,
+          silenceDurationMs,
+          postSilenceBufferMs,
+          minSpeechDurationMs,
+          noSpeechTimeoutMs,
+          onSpeechStart: () => {
+            if (!isUserSpeakingRef.current) {
+              isUserSpeakingRef.current = true;
+              setIsUserSpeaking(true);
+            }
+          },
+        }
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Speech recognition failed.";
       setError(msg);
       setStatus("error");
       setCallActive(false);
     }
-  }, [processTranscript]);
+  }, [processTranscript, session]);
 
   // Keep refs in sync so closures (playBlob, barge-in) always call the latest version
   useEffect(() => {
@@ -831,37 +1166,24 @@ export function VoiceRecorder() {
     noSpeechCountRef.current = 0;
     echoBaselineRef.current = 0;
 
-    // ── Start listening FIRST so the user's opening words are never missed ──
-    // Previously getUserMedia was called before Web Speech, which caused a
-    // hardware-level conflict: Chrome's Audio pipeline was occupied by the AEC
-    // stream setup, making Web Speech return "(no speech)" immediately on the
-    // first turn. Starting Web Speech first avoids this race condition entirely.
-    startCallListening();
-
-    // ── Acquire AEC stream in the background, 400 ms after Web Speech starts ──
-    // Two benefits once active:
-    //   (a) echoCancellation:true on getUserMedia triggers OS-level hardware AEC
-    //       for the physical device. Web Speech API shares the same mic so it
-    //       also receives the AEC-processed signal — cleaner input.
-    //   (b) The stream feeds createMicEnergyMonitor so we can gate barge-in
-    //       triggers against the echo-floor baseline on subsequent turns.
-    // Delayed 400 ms so the AudioContext doesn't interfere with Web Speech startup.
-    setTimeout(() => {
-      if (!isCallActiveRef.current) return;
-      navigator.mediaDevices?.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      }).then((stream) => {
-        if (!isCallActiveRef.current) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        micStreamRef.current = stream;
-        micEnergyMonitorRef.current = createMicEnergyMonitor(stream);
-        vLog("info", "AEC STREAM", "mic acquired — hardware echo cancellation active");
-      }).catch(() => {
-        vLog("warn", "AEC STREAM", "could not acquire AEC stream — energy gate disabled");
-      });
-    }, 400);
+    // Acquire echo-cancelled mic immediately (VAD + continuous STT depend on it).
+    navigator.mediaDevices?.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    }).then((stream) => {
+      if (!isCallActiveRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      micStreamRef.current = stream;
+      micEnergyMonitorRef.current = createMicEnergyMonitor(stream);
+      vLog("info", "AEC STREAM", "mic acquired — hardware echo cancellation active");
+      startCallListening();
+    }).catch(() => {
+      vLog("warn", "AEC STREAM", "could not acquire AEC stream");
+      setError("Microphone permission failed. Please allow mic access and try again.");
+      setStatus("error");
+      setCallActive(false);
+    });
   };
 
   const handleEndCall = () => {
@@ -870,6 +1192,10 @@ export function VoiceRecorder() {
     setIsSpeaking(false);
     setInterimText("");
     setIsBargedIn(false);
+    if (fillerTimerRef.current !== null) {
+      window.clearTimeout(fillerTimerRef.current);
+      fillerTimerRef.current = null;
+    }
 
     // Stop any playing audio
     if (audioInstanceRef.current) {
@@ -881,6 +1207,14 @@ export function VoiceRecorder() {
     speechHandleRef.current?.stop();
     speechHandleRef.current = null;
     stopBargeIn();
+    vadCleanupRef.current?.();
+    vadCleanupRef.current = null;
+    if (vadFinalizationTimeoutRef.current !== null) {
+      window.clearTimeout(vadFinalizationTimeoutRef.current);
+      vadFinalizationTimeoutRef.current = null;
+    }
+    isUserSpeakingRef.current = false;
+    setIsUserSpeaking(false);
 
     // Release AEC mic stream and energy monitor
     if (echoBaselineSamplerRef.current !== null) {

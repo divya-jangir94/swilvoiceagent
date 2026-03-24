@@ -89,9 +89,10 @@ export function startBargeInListener(params: {
   let ended = false;
 
   // Minimum words before considering it a real barge-in.
-  // Set to 2 so that single echoed syllables or brief noise don't false-trigger.
-  // Real user interruptions are almost always 2+ words ("wait", "listen here", "हाँ सुनो").
-  const BARGE_IN_WORD_THRESHOLD = 2;
+  // Minimum words before we consider it a potential interruption.
+  // Keep it at 1 to allow quick commands ("wait", "stop") to barge-in.
+  // Echo/self-voice safety is handled by the caller's echo guards (energy + text + final rejection).
+  const BARGE_IN_WORD_THRESHOLD = 1;
 
   recognition.onresult = (event: SpeechRecognitionEvent) => {
     let interim = "";
@@ -205,11 +206,77 @@ export function startWebSpeechSTT(params: {
   };
 }
 
+/**
+ * Continuous Web Speech recognition.
+ *
+ * - Collects only final segments via `onFinal()`.
+ * - Caller decides when to stop (e.g. via external VAD silence).
+ * - Useful to prevent premature endpointing: Web Speech `onend` timing
+ *   is browser-specific, so we avoid using it to finalize the utterance.
+ */
+export function startContinuousWebSpeechSTT(params: {
+  lang?: string;
+  onFinal: (finalText: string) => void;
+  onInterim?: (interimText: string) => void;
+  onError: (err: Error) => void;
+}): WebSpeechHandle {
+  const SR = getSpeechRecognitionCtor();
+  if (!SR) throw new Error("Web Speech API not supported. Please open this page in Chrome or Edge.");
+
+  const recognition = new SR();
+  recognition.lang = params.lang ?? "en-IN";
+  recognition.interimResults = true;
+  recognition.continuous = true;
+  recognition.maxAlternatives = 1;
+
+  let ended = false;
+
+  recognition.onresult = (event: SpeechRecognitionEvent) => {
+    let interim = "";
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const r = event.results[i];
+      if (r.isFinal) {
+        const txt = r[0]?.transcript?.trim() ?? "";
+        if (txt) params.onFinal(txt);
+      } else {
+        interim += r[0]?.transcript ?? "";
+      }
+    }
+    params.onInterim?.(interim.trim());
+  };
+
+  recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+    if (ended) return;
+    if (event.error === "no-speech" || event.error === "aborted") return;
+    params.onError(new Error(`Speech recognition error: ${event.error}`));
+  };
+
+  // In continuous mode, onend can fire unexpectedly; we just let caller
+  // restart if desired (for our VAD-driven finalization, we mainly stop ourselves).
+  recognition.onend = () => {
+    if (ended) return;
+  };
+
+  try {
+    recognition.start();
+    vLog("info", "WEB SPEECH (CONTINUOUS)", `started — lang=${recognition.lang}`);
+  } catch {
+    // ignore
+  }
+
+  return {
+    stop: () => {
+      ended = true;
+      try { recognition.stop(); } catch { /* ignore */ }
+    },
+  };
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Cartesia TTS — called directly from the browser.
 // ─────────────────────────────────────────────────────────────────
 const CARTESIA_API_URL = "https://api.cartesia.ai/tts/bytes";
-const CARTESIA_API_KEY = "sk_car_aikUv8n322LXqMDYMMMbqc";
+const CARTESIA_API_KEY = "sk_car_hbjDH7goyNFdUKgi2LcptT";
 const CARTESIA_VERSION = "2026-03-01";
 const CARTESIA_MODEL = "sonic-3";
 const CARTESIA_VOICE_ID = "791d5162-d5eb-40f0-8189-f19db44611d8";
@@ -406,21 +473,27 @@ export function base64ToAudioUrl(
 // ─────────────────────────────────────────────────────────────────
 export function monitorSilence(
   stream: MediaStream,
-  onSilenceDetected: () => void,
+  onSilenceDetected: (spokenMs: number) => void,
   options?: {
     threshold?: number;
     silenceDurationMs?: number;
-    minRecordingMs?: number;
+    // Extra quiet time after `silenceDurationMs` before finalizing.
+    postSilenceBufferMs?: number;
+    // Ignore utterances shorter than this (e.g. "uh", "hmm").
+    minSpeechDurationMs?: number;
     maxRecordingMs?: number;
     noSpeechTimeoutMs?: number;
+    onSpeechStart?: () => void;
   }
 ): () => void {
   const {
     threshold = 8,
     silenceDurationMs = 1500,
-    minRecordingMs = 1200,
+    postSilenceBufferMs = 800,
+    minSpeechDurationMs = 650,
     maxRecordingMs = 60_000,
     noSpeechTimeoutMs = 12_000,
+    onSpeechStart,
   } = options ?? {};
 
   const AudioCtxCtor =
@@ -452,7 +525,8 @@ export function monitorSilence(
   const trigger = () => {
     if (stopped) return;
     cleanup();
-    onSilenceDetected();
+    const spokenMs = speechLoggedAt ? Date.now() - speechLoggedAt : 0;
+    onSilenceDetected(spokenMs);
   };
 
   const maxTimer = window.setTimeout(trigger, maxRecordingMs);
@@ -479,13 +553,29 @@ export function monitorSilence(
       }
       hasSpeech = true;
       silenceStart = null;
-    } else if (hasSpeech && Date.now() - startedAt >= minRecordingMs) {
+    } else if (hasSpeech) {
       if (silenceStart === null) silenceStart = Date.now();
-      if (Date.now() - silenceStart >= silenceDurationMs) {
+
+      const silentForMs = Date.now() - silenceStart;
+      const neededMs = silenceDurationMs + postSilenceBufferMs;
+
+      if (silentForMs >= neededMs) {
         const spokenMs = speechLoggedAt ? Date.now() - speechLoggedAt : 0;
-        vLog("info", "VAD: SILENCE", `silence detected — stopping  spoken≈${(spokenMs / 1000).toFixed(1)}s`);
-        trigger();
-        return;
+        vLog(
+          "info",
+          "VAD: SILENCE",
+          `silence detected — stopping spoken≈${(spokenMs / 1000).toFixed(1)}s (minSpeech=${(minSpeechDurationMs / 1000).toFixed(1)}s)`
+        );
+
+        if (spokenMs >= minSpeechDurationMs) {
+          trigger();
+          return;
+        }
+
+        // Too-short utterance: ignore and keep listening.
+        hasSpeech = false;
+        speechLoggedAt = null;
+        silenceStart = null;
       }
     }
 
