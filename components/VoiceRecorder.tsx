@@ -37,7 +37,7 @@ function editDistance(a: string, b: string): number {
   const dp: number[] = Array.from({ length: n + 1 }, (_, j) => j);
   for (let i = 1; i <= m; i++) {
     let prev = dp[0];
-    dp[0] = i;
+    dp[0] = i; 
     for (let j = 1; j <= n; j++) {
       const temp = dp[j];
       dp[j] = a[i - 1] === b[j - 1] ? prev : 1 + Math.min(prev, dp[j], dp[j - 1]);
@@ -45,6 +45,267 @@ function editDistance(a: string, b: string): number {
     }
   }
   return dp[n];
+}
+
+const STT_DOMAIN_VOCAB = [
+  "hello",
+  "hi",
+  "thanks",
+  "please",
+  "stop",
+  "start",
+  "repeat",
+  "again",
+  // SWIL / product-specific terms (preferred by fuzzy auto-correction).
+  "swil",
+  "erp",
+  "login",
+  "logout",
+  "password",
+  "billing",
+  "invoice",
+  "invoicing",
+  "inventory",
+  "stock",
+  "gst",
+  "accounting",
+  "purchase",
+  "sales",
+  "reporting",
+  "analytics",
+  "automation",
+  "dashboard",
+  "english",
+];
+
+/**
+ * Force keyword normalization (alias -> canonical).
+ * This is stronger than fuzzy matching: when an alias is detected in the
+ * transcript, we replace it so the AI always sees the expected word.
+ */
+const STT_KEYWORD_ALIASES: Record<string, string> = {
+  // Phrase-level brand aliases (common STT mis-hearings in context).
+  "sur erp": "swil erp",
+  "sir erp": "swil erp",
+  "siri erp": "swil erp",
+  "self erp": "swil erp",
+  "seal erp": "swil erp",
+  "swirl erp": "swil erp",
+  feelerp: "swil erp", 
+
+  // SWIL brand aliases seen in STT mis-hearings.
+  swell: "swil",
+  steel: "swil",
+  essel: "swil",
+  sweet: "swil", 
+  school: "swil", 
+  civil: "swil", 
+  fhill: "swil",
+
+  // ERP term aliases.
+  "e r p": "erp",
+  erp: "erp",
+  urp: "erp",
+  airp: "erp",
+  er: "erp",
+  rp: "erp",
+ erb: "erp",
+ trp: "erp", 
+
+  // login/logout aliases.
+  "log in": "login",
+  "log-in": "login",
+  logout: "logout",
+  "log out": "logout",
+  "log-out": "logout",
+
+  // password aliases.
+  password: "password",
+  passward: "password",
+
+  // common support terms.
+  billing: "billing",
+  invoice: "invoice",
+  inventory: "inventory",
+  deshboard: "dashboard",
+  dashbord: "dashboard",
+  "dash board": "dashboard",
+  classboard: "dashboard",
+  gst: "gst",
+};
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeKeywordAliases(transcript: string): string {
+  let out = transcript;
+
+  // Replace phrases/words case-insensitively using word boundaries.
+  // Supports aliases with spaces or hyphens by allowing `[\s-]+` between tokens.
+  for (const [alias, canonical] of Object.entries(STT_KEYWORD_ALIASES)) {
+    const aliasTokens = alias
+      .replace(/-/g, " ")
+      .split(/\s+/)
+      .filter(Boolean);
+    if (aliasTokens.length === 0) continue;
+
+    const aliasPattern = aliasTokens.map(escapeRegExp).join("[\\s\\-]+");
+    const re = new RegExp(`\\b${aliasPattern}\\b`, "gi");
+    out = out.replace(re, canonical);
+  }
+
+  return out;
+}
+
+function normalizeSpeechTextForWords(t: string): string {
+  return t
+    .toLowerCase()
+    .replace(/[^\w\s\u0900-\u097F]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeSpeechWords(t: string): string[] {
+  return normalizeSpeechTextForWords(t).split(" ").filter(Boolean);
+}
+
+function looksDevanagariWord(w: string): boolean {
+  return /[\u0900-\u097F]/.test(w);
+}
+
+function phoneticNormalizeLatinWord(w: string): string {
+  return w
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+    .replace(/ph/g, "f")
+    .replace(/ck/g, "k")
+    .replace(/[q]/g, "k")
+    .replace(/[vw]/g, "v")
+    .replace(/[z]/g, "s")
+    .replace(/[x]/g, "ks")
+    .replace(/(.)\1+/g, "$1");
+}
+
+function bestFuzzyCandidate(
+  sourceWord: string,
+  vocab: string[]
+): { candidate: string; confidence: number } | null {
+  const word = sourceWord.toLowerCase();
+  if (!word) return null;
+
+  const isDevanagari = looksDevanagariWord(word);
+  const sourcePhonetic = isDevanagari ? "" : phoneticNormalizeLatinWord(word);
+
+  let best: { candidate: string; score: number } | null = null;
+  let secondBestScore = Number.NEGATIVE_INFINITY;
+
+  for (const candidate of vocab) {
+    if (!candidate) continue;
+    if (candidate === word) {
+      return { candidate, confidence: 1 };
+    }
+    if (Math.abs(candidate.length - word.length) > 3) continue;
+
+    const d = editDistance(word, candidate);
+    const maxLen = Math.max(word.length, candidate.length, 1);
+    const similarity = 1 - d / maxLen;
+
+    let score = similarity;
+    if (!isDevanagari) {
+      const cPhonetic = phoneticNormalizeLatinWord(candidate);
+      if (sourcePhonetic && cPhonetic) {
+        const pd = editDistance(sourcePhonetic, cPhonetic);
+        const pLen = Math.max(sourcePhonetic.length, cPhonetic.length, 1);
+        const phoneticSimilarity = 1 - pd / pLen;
+        score = Math.max(score, (similarity * 0.7) + (phoneticSimilarity * 0.3));
+      }
+    }
+
+    if (score > (best?.score ?? Number.NEGATIVE_INFINITY)) {
+      secondBestScore = best?.score ?? Number.NEGATIVE_INFINITY;
+      best = { candidate, score };
+    } else if (score > secondBestScore) {
+      secondBestScore = score;
+    }
+  }
+
+  if (!best) return null;
+  const confidence = best.score - Math.max(secondBestScore, 0);
+  return { candidate: best.candidate, confidence };
+}
+
+function buildCorrectionVocabulary(params: {
+  lastBotReply: string;
+  recentMessages: ChatMessage[];
+}): string[] {
+  const out = new Set<string>();
+  for (const w of STT_DOMAIN_VOCAB) out.add(w);
+
+  const pushText = (txt: string) => {
+    for (const w of tokenizeSpeechWords(txt)) {
+      if (w.length >= 3) out.add(w);
+    }
+  };
+
+  if (params.lastBotReply) pushText(params.lastBotReply);
+  for (const m of params.recentMessages) {
+    if (m.text) pushText(m.text);
+    if (m.transcript) pushText(m.transcript);
+  }
+
+  return Array.from(out);
+}
+
+/**
+ * Conservative fuzzy auto-correction for Web Speech STT output.
+ * Replaces a word only on high confidence (very close candidate match).
+ */
+function autoCorrectTranscriptFuzzy(params: {
+  transcript: string;
+  lastBotReply: string;
+  recentMessages: ChatMessage[];
+}): string {
+  const { transcript, lastBotReply, recentMessages } = params;
+  if (!transcript.trim()) return transcript;
+
+  const vocab = buildCorrectionVocabulary({ lastBotReply, recentMessages });
+  if (vocab.length === 0) return transcript;
+
+  const rawTokens = transcript.split(/\s+/).filter(Boolean);
+  const corrected = rawTokens.map((rawToken) => {
+    // Keep punctuation around the word.
+    const prefix = (rawToken.match(/^[^\w\u0900-\u097F]*/) ?? [""])[0];
+    const suffix = (rawToken.match(/[^\w\u0900-\u097F]*$/) ?? [""])[0];
+    const core = rawToken.slice(prefix.length, rawToken.length - suffix.length);
+    if (!core) return rawToken;
+
+    const coreNorm = core.toLowerCase();
+    if (coreNorm.length < 4) return rawToken;
+
+    const best = bestFuzzyCandidate(coreNorm, vocab);
+    if (!best || best.candidate === coreNorm) return rawToken;
+
+    // Conservative gating:
+    // - similarity threshold guards against semantic drift
+    // - confidence margin avoids replacing when multiple candidates are similarly close
+    const dist = editDistance(coreNorm, best.candidate);
+    const maxLen = Math.max(coreNorm.length, best.candidate.length, 1);
+    const similarity = 1 - dist / maxLen;
+    const maxAllowed = coreNorm.length >= 8 ? 2 : 1;
+    if (dist > maxAllowed) return rawToken;
+    if (similarity < 0.72) return rawToken;
+    if (best.confidence < 0.08) return rawToken;
+
+    // Keep simple capitalization style of the original token.
+    const replacement =
+      core[0] === core[0].toUpperCase()
+        ? best.candidate[0].toUpperCase() + best.candidate.slice(1)
+        : best.candidate;
+    return `${prefix}${replacement}${suffix}`;
+  });
+
+  return corrected.join(" ");
 }
 
 /**
@@ -893,8 +1154,10 @@ export function VoiceRecorder() {
 
     try {
       // Send transcript to /api/voice — Groq STT is skipped, goes straight to GPT
+      // Canonicalize key terms so the assistant understands them consistently.
+      const normalizedTranscript = normalizeKeywordAliases(transcript);
       const form = new FormData();
-      form.append("transcript", transcript);
+      form.append("transcript", normalizedTranscript);
       form.append("session_id", sessionId || (session ?? loadSession()).id);
 
       const res = await fetch("/api/voice", { method: "POST", body: form });
@@ -1043,6 +1306,7 @@ export function VoiceRecorder() {
           const t = finalText.trim();
           if (!t) return;
           capturedFinalRef.current = capturedFinalRef.current ? `${capturedFinalRef.current} ${t}` : t;
+          vLog("info", "STT FINAL", `"${t.slice(0, 60)}"`);
         },
         onInterim: (text) => {
           latestInterimRef.current = text.trim();
@@ -1067,8 +1331,6 @@ export function VoiceRecorder() {
           // This callback already implies silenceDurationMs + postSilenceBufferMs,
           // and monitorSilence also ignores short utterances.
           vadCleanupRef.current = null;
-          speechHandleRef.current?.stop();
-          speechHandleRef.current = null;
 
           isUserSpeakingRef.current = false;
           setIsUserSpeaking(false);
@@ -1076,55 +1338,90 @@ export function VoiceRecorder() {
 
           if (!isCallActiveRef.current) return;
 
-          // Prefer true final chunks. If browser didn't emit isFinal in time,
-          // fall back to the latest interim text so real speech isn't dropped.
-          let clean = capturedFinalRef.current.trim();
-          if (!clean) {
-            const interimFallback = latestInterimRef.current.trim();
-            if (interimFallback.length >= 2) {
-              clean = interimFallback;
-              vLog("info", "STT FALLBACK", `using interim fallback: "${clean.slice(0, 60)}"`);
+          // Keep STT alive briefly so final chunks can arrive after VAD silence.
+          if (vadFinalizationTimeoutRef.current !== null) {
+            window.clearTimeout(vadFinalizationTimeoutRef.current);
+            vadFinalizationTimeoutRef.current = null;
+          }
+          vadFinalizationTimeoutRef.current = window.setTimeout(() => {
+            vadFinalizationTimeoutRef.current = null;
+            if (!isCallActiveRef.current) return;
+
+            speechHandleRef.current?.stop();
+            speechHandleRef.current = null;
+
+            // Prefer true final chunks. If browser didn't emit isFinal in time,
+            // fall back to interim only when we actually detected speech.
+            let clean = capturedFinalRef.current.trim();
+            if (!clean) {
+              const interimFallback = latestInterimRef.current.trim();
+              const interimWords = interimFallback.split(/\s+/).filter(Boolean);
+              const hadRealSpeech = spokenMs >= 300;
+              // Guard against no-speech timeouts picking up stray echo/noise text.
+              if (hadRealSpeech && (interimWords.length >= 1 || interimFallback.length >= 4)) {
+                clean = interimFallback;
+                vLog("info", "STT FALLBACK", `using interim fallback: "${clean.slice(0, 60)}"`);
+              }
             }
-          }
-          capturedFinalRef.current = "";
-          latestInterimRef.current = "";
+            capturedFinalRef.current = "";
+            latestInterimRef.current = "";
 
-          if (!clean) {
-            noSpeechCountRef.current += 1;
-            vLog("warn", "NO SPEECH", `VAD ended but transcript empty — retry #${noSpeechCountRef.current}`);
-            if (noSpeechCountRef.current >= 2) {
-              setError("Can't hear you. Please speak clearly or check your microphone.");
-              setStatus("error");
-              setTimeout(() => {
-                if (isCallActiveRef.current) {
-                  setError(null);
-                  noSpeechCountRef.current = 0;
-                  startCallListeningRef.current?.();
-                }
-              }, 3000);
-            } else {
-              setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 500);
+            if (!clean) {
+              noSpeechCountRef.current += 1;
+              vLog("warn", "NO SPEECH", `VAD ended but transcript empty — retry #${noSpeechCountRef.current}`);
+              if (noSpeechCountRef.current >= 2) {
+                setError("Can't hear you. Please speak clearly or check your microphone.");
+                setStatus("error");
+                setTimeout(() => {
+                  if (isCallActiveRef.current) {
+                    setError(null);
+                    noSpeechCountRef.current = 0;
+                    startCallListeningRef.current?.();
+                  }
+                }, 3000);
+              } else {
+                setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 500);
+              }
+              return;
             }
-            return;
-          }
 
-          noSpeechCountRef.current = 0;
+            const cleanWords = clean.split(/\s+/).filter(Boolean);
+            const hadRealSpeech = spokenMs >= 300;
+            if (!hadRealSpeech && cleanWords.length <= 2 && clean.length < 18) {
+              noSpeechCountRef.current += 1;
+              vLog("warn", "NO SPEECH", `discarding low-speech transcript "${clean}" — retry #${noSpeechCountRef.current}`);
+              setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 350);
+              return;
+            }
 
-          // ── Echo guard (avoid self-voice / bot playback) ────────────────
-          const wordCount = clean.split(/\s+/).filter(Boolean).length;
-          const msSinceTTS2 = Date.now() - lastTTSEndRef.current;
-          if (wordCount === 1 && msSinceTTS2 < 1200) {
-            vLog("warn", "ECHO (temporal)", `"${clean}" — 1 word, ${msSinceTTS2}ms after TTS`);
-            setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 300);
-            return;
-          }
-          if (isEcho(clean, lastBotReplyRef.current) || isEchoFuzzy(clean, lastBotReplyRef.current)) {
-            vLog("warn", "ECHO (overlap)", `"${clean.slice(0, 60)}" — restarting listener`);
-            setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 300);
-            return;
-          }
+            noSpeechCountRef.current = 0;
 
-          processTranscript(clean);
+            // ── Echo guard (avoid self-voice / bot playback) ────────────────
+            const wordCount = cleanWords.length;
+            const msSinceTTS2 = Date.now() - lastTTSEndRef.current;
+            if (wordCount === 1 && msSinceTTS2 < 1200) {
+              vLog("warn", "ECHO (temporal)", `"${clean}" — 1 word, ${msSinceTTS2}ms after TTS`);
+              setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 300);
+              return;
+            }
+            if (isEcho(clean, lastBotReplyRef.current) || isEchoFuzzy(clean, lastBotReplyRef.current)) {
+              vLog("warn", "ECHO (overlap)", `"${clean.slice(0, 60)}" — restarting listener`);
+              setTimeout(() => { if (isCallActiveRef.current) startCallListeningRef.current?.(); }, 300);
+              return;
+            }
+
+            const recentMessagesForCorrection = (session ?? loadSession()).messages.slice(-12);
+            const correctedTranscript = autoCorrectTranscriptFuzzy({
+              transcript: clean,
+              lastBotReply: lastBotReplyRef.current,
+              recentMessages: recentMessagesForCorrection,
+            });
+            if (correctedTranscript !== clean) {
+              vLog("info", "STT AUTOCORRECT", `"${clean}" -> "${correctedTranscript}"`);
+            }
+
+            processTranscript(correctedTranscript);
+          }, isFirstTurnInSession ? 1200 : 700);
         },
         {
           threshold,

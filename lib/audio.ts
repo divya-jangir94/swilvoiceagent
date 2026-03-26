@@ -276,7 +276,7 @@ export function startContinuousWebSpeechSTT(params: {
 // Cartesia TTS — called directly from the browser.
 // ─────────────────────────────────────────────────────────────────
 const CARTESIA_API_URL = "https://api.cartesia.ai/tts/bytes";
-const CARTESIA_API_KEY = "sk_car_hbjDH7goyNFdUKgi2LcptT";
+const CARTESIA_API_KEY = "sk_car_iJzFxpizkY9tVZ9jsj41M3";
 const CARTESIA_VERSION = "2026-03-01";
 const CARTESIA_MODEL = "sonic-3";
 const CARTESIA_VOICE_ID = "791d5162-d5eb-40f0-8189-f19db44611d8";
